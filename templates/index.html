@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy-First Legal AI RAG</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .container { max-width: 1200px; margin-top: 50px; }
+        .card { border: none; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .btn-primary { border-radius: 8px; }
+        .chat-box { height: 400px; overflow-y: auto; background: white; padding: 20px; border-radius: 10px; border: 1px solid #dee2e6; }
+        .clause-item { border-left: 4px solid #007bff; padding-left: 15px; margin-bottom: 15px; }
+        .risk-high { border-left-color: #dc3545; }
+        .risk-medium { border-left-color: #ffc107; }
+        .risk-low { border-left-color: #198754; }
+        #image-gallery img { max-width: 100%; border-radius: 10px; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="demo-banner" class="alert alert-warning text-center" style="{% if not use_mock %}display:none;{% endif %} border-radius: 15px; margin-bottom: 20px;">
+            Demo Mode Active: OpenAI Quota exceeded. Using placeholder responses.
+        </div>
+        <h1 class="mb-4 text-center">Privacy-First Legal AI RAG</h1>
+        
+        <div class="row">
+            <div class="col-md-4">
+                <div class="card p-4">
+                    <h3>Upload Contract</h3>
+                    <form id="upload-form">
+                        <div class="mb-3">
+                            <input type="file" class="form-control" id="file-input" accept=".pdf" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="collection-input" class="form-label">Qdrant Collection</label>
+                            <input type="text" class="form-control" id="collection-input" value="legal_ai_gemini_v3">
+                        </div>
+                        <button type="submit" class="btn btn-primary w-100" id="upload-btn">Upload & Process</button>
+                    </form>
+                    <div id="status-msg" class="mt-3"></div>
+                </div>
+
+                <div class="card p-4">
+                    <h3>Detected Clauses</h3>
+                    <div id="clauses-list">
+                        <p class="text-muted">Upload a document to see clauses.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-8">
+                <div class="card p-4">
+                    <h3>Ask a Question</h3>
+                    <div class="input-group mb-3">
+                        <input type="text" class="form-control" id="question-input" placeholder="Ask about the contract...">
+                        <button class="btn btn-primary" id="ask-btn" disabled>Ask</button>
+                    </div>
+                    <div id="answer-area" class="mt-3 p-3 bg-light rounded" style="display:none;">
+                        <h5>Answer:</h5>
+                        <div id="answer-text"></div>
+                    </div>
+                </div>
+
+                <div class="card p-4">
+                    <h3>Extracted Images</h3>
+                    <div id="image-gallery" class="row">
+                        <p class="text-muted">No images yet.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentCollection = "legal_ai_gemini_v3";
+
+        document.getElementById('upload-form').onsubmit = async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('upload-btn');
+            const status = document.getElementById('status-msg');
+            const file = document.getElementById('file-input').files[0];
+            currentCollection = document.getElementById('collection-input').value;
+
+            if (!file) return;
+
+            btn.disabled = true;
+            status.innerHTML = '<div class="spinner-border spinner-border-sm text-primary"></div> Processing...';
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('collection_name', currentCollection);
+
+            try {
+                const resp = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await resp.json();
+                
+                if (resp.ok) {
+                    status.innerHTML = '<span class="text-success">Processed successfully!</span>';
+                    document.getElementById('ask-btn').disabled = false;
+                    renderClauses(data.clauses, data.risks);
+                    renderImages(data.images);
+                } else {
+                    status.innerHTML = `<span class="text-danger">Error: ${data.detail}</span>`;
+                }
+            } catch (err) {
+                status.innerHTML = '<span class="text-danger">Connection error</span>';
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        document.getElementById('ask-btn').onclick = async () => {
+            const btn = document.getElementById('ask-btn');
+            const input = document.getElementById('question-input');
+            const area = document.getElementById('answer-area');
+            const text = document.getElementById('answer-text');
+
+            const question = input.value.trim();
+            if (!question) return;
+
+            btn.disabled = true;
+            text.innerHTML = '<div class="spinner-border spinner-border-sm text-primary"></div> Thinking...';
+            area.style.display = 'block';
+
+            try {
+                const resp = await fetch('/ask', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question, collection_name: currentCollection })
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    text.innerHTML = data.answer.replace(/\n/g, '<br>');
+                } else {
+                    text.innerHTML = `<span class="text-danger">Error: ${data.detail || 'Unknown error'}</span>`;
+                }
+            } catch (err) {
+                text.innerHTML = '<span class="text-danger">Connection error or invalid response</span>';
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        function renderClauses(clauses, risks) {
+            const list = document.getElementById('clauses-list');
+            list.innerHTML = '';
+            clauses.forEach((c, i) => {
+                const risk = risks[i];
+                const div = document.createElement('div');
+                div.className = `clause-item risk-${risk.risk_level.toLowerCase()}`;
+                div.innerHTML = `
+                    <strong>${c.clause_type}</strong> (Page ${c.page_number})<br>
+                    <small class="text-muted">Risk: ${risk.risk_level}</small><br>
+                    <p class="mb-1">${risk.explanation}</p>
+                `;
+                list.appendChild(div);
+            });
+        }
+
+        function renderImages(images) {
+            const gallery = document.getElementById('image-gallery');
+            gallery.innerHTML = '';
+            if (images.length === 0) {
+                gallery.innerHTML = '<p class="text-muted">No images detected.</p>';
+                return;
+            }
+            images.forEach(img => {
+                const div = document.createElement('div');
+                div.className = 'col-md-6 mb-3';
+                div.innerHTML = `
+                    <img src="${img.url}" class="img-fluid border" alt="${img.caption}">
+                    <p class="small text-center mt-1">${img.caption}</p>
+                `;
+                gallery.appendChild(div);
+            });
+        }
+    </script>
+</body>
+</html>

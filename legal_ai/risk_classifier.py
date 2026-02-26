@@ -34,6 +34,10 @@ class RiskAssessment(BaseModel):
     matched_text: str = ""
 
 
+import time
+
+# ... (other imports)
+
 class RiskClassifier:
     """Classify detected clauses by risk level using OpenAI."""
 
@@ -41,7 +45,9 @@ class RiskClassifier:
         """Classify each detected clause as HIGH, MEDIUM, or LOW risk."""
         assessments: list[RiskAssessment] = []
 
-        for clause in clauses:
+        for i, clause in enumerate(clauses):
+            if i > 0:
+                time.sleep(2.0) # More delay between LLM calls for risk analysis
             level_str, explanation = classify_clause_risk(
                 clause_type=clause.clause_type,
                 clause_text=clause.matched_text,

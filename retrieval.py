@@ -3,25 +3,22 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qm
 from rank_bm25 import BM25Okapi
 
-from embeddings import embed_texts
+from embeddings import embed_texts, get_local_collection
 
 
 @dataclass
 class RetrievedPoint:
     """A single retrieved item from hybrid search."""
-
     id: str
     score: float
     payload: dict
 
 
-def _qdrant_client() -> QdrantClient:
+def _qdrant_client() -> Any:
     """Return a Qdrant client configured for local usage."""
     from embeddings import _qdrant_client as _base_client
 
@@ -76,9 +73,6 @@ def dense_search(
     query: str,
     top_k: int = 10,
 ) -> list[RetrievedPoint]:
-    """
-    Run pure dense similarity search in Qdrant for a query string.
-    """
     client = _qdrant_client()
     vector = embed_texts([query])[0]
 
@@ -91,9 +85,11 @@ def dense_search(
     points: list[RetrievedPoint] = []
     for r in result:
         payload = r.payload or {}
+        # Return the original chunk_id from payload if available, else the UUID
+        point_id = payload.get("chunk_id", str(r.id))
         points.append(
             RetrievedPoint(
-                id=str(r.id),
+                id=point_id,
                 score=float(r.score or 0.0),
                 payload=payload,
             )
@@ -108,10 +104,33 @@ def hybrid_search(
     dense_weight: float = 0.7,
     bm25_weight: float = 0.3,
 ) -> list[RetrievedPoint]:
-    """
-    Run hybrid dense + BM25 retrieval.
-    """
-    dense_results = dense_search(collection, query, top_k=top_k)
+    try:
+        dense_results = dense_search(collection, query, top_k=top_k)
+    except Exception:
+        local_points = get_local_collection(collection)
+        if not local_points:
+            return []
+
+        payloads = [p["payload"] for p in local_points]
+        bm25_scores = _bm25_scores(query, payloads)
+        bm25_norm = _normalize(bm25_scores)
+
+        combined: list[RetrievedPoint] = []
+        for entry, score in zip(local_points, bm25_norm):
+            # entry is from _LOCAL_COLLECTIONS, which already uses UUIDs as 'id'
+            # but payload has original 'chunk_id'
+            point_id = entry["payload"].get("chunk_id", entry["id"])
+            combined.append(
+                RetrievedPoint(
+                    id=point_id,
+                    score=score,
+                    payload=entry["payload"],
+                )
+            )
+
+        combined.sort(key=lambda p: p.score, reverse=True)
+        return combined[:top_k]
+
     if not dense_results:
         return []
 
@@ -135,4 +154,3 @@ def hybrid_search(
 
     combined.sort(key=lambda p: p.score, reverse=True)
     return combined[:top_k]
-

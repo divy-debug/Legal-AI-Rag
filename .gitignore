@@ -27,3 +27,7 @@ Thumbs.db
 
 # Project output
 data/output/
+data/uploads/
+extracted_images/
+uv.lock
+.python-version

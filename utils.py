@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
 
 from legal_ai.clause_detector import ClauseType, DetectedClause
@@ -84,12 +83,6 @@ def build_chunks(
     """Convert a parsed and annotated document into citation-aware chunks."""
     annotation_index = _build_annotation_index(clauses, risks)
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ". ", "; ", ", ", " ", ""],
-    )
-
     chunks: list[CitationChunk] = []
     chunk_counter = 0
 
@@ -124,11 +117,14 @@ def build_chunks(
             page_numbers = [el.page_number for el in group if el.page_number]
             section_headings = [el.section_heading for el in group if el.section_heading]
 
-            sub_texts = text_splitter.split_text(merged_text)
+            # Simple split by chunk_size since we removed langchain_text_splitters
+            sub_texts = [
+                merged_text[i : i + chunk_size]
+                for i in range(0, len(merged_text), chunk_size - chunk_overlap)
+            ]
 
             for sub_text in sub_texts:
                 chunk_counter += 1
-
                 relevant_annotations = _match_annotations_to_subchunk(
                     sub_text, group, annotation_index
                 )
@@ -140,7 +136,9 @@ def build_chunks(
                         element_type="text",
                         source_file=parsed_doc.source_file,
                         page_number=page_numbers[0] if page_numbers else None,
-                        section_heading=section_headings[-1] if section_headings else None,
+                        section_heading=section_headings[-1]
+                        if section_headings
+                        else None,
                         element_indices=all_indices,
                         clause_types=[a[0].value for a in relevant_annotations],
                         risk_levels=[a[1].value for a in relevant_annotations],
@@ -149,18 +147,12 @@ def build_chunks(
                 )
 
     logger.info(
-        "Built %d chunks from %d elements (%d atomic, %d text-split)",
-        len(chunks),
-        len(parsed_doc.elements),
-        sum(1 for c in chunks if c.element_type in ("table", "image")),
-        sum(1 for c in chunks if c.element_type == "text"),
+        "Built %d chunks from %d elements", len(chunks), len(parsed_doc.elements)
     )
-
     return chunks
 
 
 def _group_elements(elements: list[ParsedElement]) -> list[list[ParsedElement]]:
-    """Group consecutive text elements together and keep atomic elements alone."""
     if not elements:
         return []
 
@@ -178,7 +170,6 @@ def _group_elements(elements: list[ParsedElement]) -> list[list[ParsedElement]]:
 
     if current_text_group:
         groups.append(current_text_group)
-
     return groups
 
 

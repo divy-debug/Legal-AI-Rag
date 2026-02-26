@@ -1,28 +1,60 @@
-
-
 from __future__ import annotations
 
+import logging
 import os
-from typing import Iterable, Sequence
+import json
+import time
+from typing import TYPE_CHECKING, Iterable, Sequence, Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+import google.generativeai as genai
 
 from legal_ai.clause_detector import ClauseType
-from utils import CitationChunk
+
+if TYPE_CHECKING:
+    from utils import CitationChunk
 
 load_dotenv()
 
-_CLIENT: OpenAI | None = None
+logger = logging.getLogger(__name__)
 
+# Clients
+_OPENAI_CLIENT: OpenAI | None = None
+_GEMINI_MODEL: genai.GenerativeModel | None = None
 
-def _client() -> OpenAI:
-    """Return a cached OpenAI client."""
-    global _CLIENT
-    if _CLIENT is None:
-        _CLIENT = OpenAI()
-    return _CLIENT
+def _get_provider() -> str:
+    return os.getenv("AI_PROVIDER", "openai").lower()
 
+def _openai_client() -> OpenAI:
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        _OPENAI_CLIENT = OpenAI()
+    return _OPENAI_CLIENT
+
+def _gemini_model() -> genai.GenerativeModel:
+    global _GEMINI_MODEL
+    if _GEMINI_MODEL is None:
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        _GEMINI_MODEL = genai.GenerativeModel(model_name)
+    return _GEMINI_MODEL
+
+def _gemini_generate_with_retry(model_instance, prompt, max_retries=5):
+    """Simple retry logic for Gemini quota issues."""
+    for attempt in range(max_retries):
+        try:
+            return model_instance.generate_content(prompt)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "429" in err_msg or "quota" in err_msg or "exhausted" in err_msg:
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (attempt + 1) # Wait longer: 5s, 10s, 15s, 20s, 25s
+                    logger.warning(f"Gemini quota hit, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+            raise e
+    return None
 
 def generate_image_caption(
     *,
@@ -30,167 +62,116 @@ def generate_image_caption(
     section_heading: str | None,
     model: str | None = None,
 ) -> str:
-    """
-    Generate a short generic caption for an embedded image.
-
-    The caption is intentionally generic to avoid leaking sensitive content.
-    """
-    client = _client()
-    model_name = model or os.getenv("OPENAI_IMAGE_CAPTION_MODEL", "gpt-4.1-mini")
+    if os.getenv("USE_MOCK_MODELS", "false").lower() == "true":
+        return "Image on page " + str(page_number or "?")
 
     page_text = f"page {page_number}" if page_number is not None else "the document"
     heading = section_heading or "an unlabeled section"
-
     prompt = (
-        "You are helping describe images in legal contracts without seeing the "
-        "actual image. Generate a short, neutral caption of at most 12 words "
-        "based only on the context.\n\n"
-        f"Context:\n- Document type: legal contract\n- Page: {page_text}\n"
-        f"- Section heading: {heading}\n\n"
-        "The caption must not invent details about parties, amounts, dates, "
-        "or jurisdictions. Use generic wording like 'embedded figure', "
-        "'signature block', or 'company logo' if unsure."
+        f"Generate a short, neutral legal document image caption (max 12 words) for an image on {page_text} "
+        f"under section '{heading}'. Use generic wording."
     )
 
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": "You write concise, neutral image captions."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=32,
-    )
-
-    text = response.choices[0].message.content or ""
-    return text.strip()
-
+    if _get_provider() == "gemini":
+        try:
+            model_instance = _gemini_model()
+            response = _gemini_generate_with_retry(model_instance, prompt)
+            return response.text.strip()
+        except Exception:
+            return "Embedded figure in legal document"
+    else:
+        client = _openai_client()
+        model_name = model or os.getenv("OPENAI_IMAGE_CAPTION_MODEL", "gpt-4.1-mini")
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=32,
+        )
+        return response.choices[0].message.content.strip()
 
 def classify_clause_risk(
     clause_type: ClauseType,
     clause_text: str,
     model: str | None = None,
 ) -> tuple[str, str]:
-    """
-    Classify a clause as High/Medium/Low risk with explanation.
-
-    Returns (risk_level, explanation).
-    """
-    client = _client()
-    model_name = model or os.getenv("OPENAI_RISK_MODEL", "gpt-4.1-mini")
+    if os.getenv("USE_MOCK_MODELS", "false").lower() == "true":
+        return "Low", "Demo Mode: Risk analysis placeholder."
 
     system = (
-        "You are a legal assistant classifying contract clauses into risk levels. "
-        "Return a JSON object with keys 'risk_level' and 'explanation'. "
-        "risk_level must be one of: High, Medium, Low."
+        "You are a legal assistant. Return JSON with keys 'risk_level' (High, Medium, Low) and 'explanation'."
     )
+    user_prompt = f"Clause Type: {clause_type.value}\nText: {clause_text}"
 
-    user = (
-        f"Clause type: {clause_type.value}\n\n"
-        "Clause text:\n"
-        f"{clause_text}\n\n"
-        "Decide the overall risk from the perspective of a cautious but "
-        "commercially reasonable customer. "
-        "Explain your reasoning in 2–3 sentences, focusing on concrete wording."
-    )
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0,
-        max_tokens=256,
-        response_format={"type": "json_object"},
-    )
-
-    content = response.choices[0].message.content or "{}"
-    import json
-
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        return "Medium", (
-            "The clause presents some potential concerns, but the analysis "
-            "could not be fully parsed. Manual review is recommended."
-        )
-
-    level = str(data.get("risk_level", "Medium")).strip()
-    explanation = str(data.get("explanation", "")).strip()
-    if level not in {"High", "Medium", "Low"}:
-        level = "Medium"
-    if not explanation:
-        explanation = (
-            "The clause has been assessed as "
-            f"{level} risk based on its wording."
-        )
-    return level, explanation
-
-
-def _format_citation(chunk: CitationChunk) -> str:
-    """Return a human-readable citation string for a chunk."""
-    page = f"Page {chunk.page_number}" if chunk.page_number else "Unknown page"
-    heading = chunk.section_heading or "Unknown section"
-    return f"{heading} ({page})"
-
+    if _get_provider() == "gemini":
+        try:
+            model_instance = _gemini_model()
+            full_prompt = f"{system}\n\n{user_prompt}\n\nReturn the result as a raw JSON string."
+            
+            response = _gemini_generate_with_retry(model_instance, full_prompt)
+            if not response:
+                return "Medium", "Gemini failed to generate response."
+            
+            # Extract JSON from potential markdown blocks
+            text = response.text.strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            
+            data = json.loads(text)
+            return data.get("risk_level", "Medium"), data.get("explanation", "No explanation.")
+        except Exception as e:
+            logger.error(f"Gemini Risk Error: {e}")
+            if "quota" in str(e).lower() or "429" in str(e):
+                return "Medium", "Gemini Quota Exceeded after retries."
+            return "Medium", f"Error: {str(e)}"
+    else:
+        client = _openai_client()
+        model_name = model or os.getenv("OPENAI_RISK_MODEL", "gpt-4.1-mini")
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"}
+            )
+            data = json.loads(response.choices[0].message.content)
+            return data.get("risk_level", "Medium"), data.get("explanation", "No explanation.")
+        except Exception as e:
+            return "Medium", "OpenAI Error."
 
 def answer_with_citations(
     question: str,
-    chunks: Sequence[CitationChunk],
+    context: Iterable[CitationChunk],
     model: str | None = None,
 ) -> str:
-    """
-    Answer a question strictly using the provided chunks.
+    if os.getenv("USE_MOCK_MODELS", "false").lower() == "true":
+        return "Demo Mode: Citation answer placeholder."
 
-    The response includes inline citations in the form
-    'According to <heading> (Page X)...'.
-    """
-    client = _client()
-    model_name = model or os.getenv("OPENAI_QA_MODEL", "gpt-4.1-mini")
+    context_text = "\n\n".join([f"[{c.chunk_id}]: {c.content}" for c in context])
+    prompt = f"Question: {question}\n\nContext:\n{context_text}\n\nAnswer concisely with citations."
 
-    context_blocks: list[str] = []
-    for i, chunk in enumerate(chunks, start=1):
-        citation = _format_citation(chunk)
-        context_blocks.append(
-            f"[{i}] {citation}\n"
-            f"Type: {chunk.element_type}\n"
-            f"Content:\n{chunk.content}\n"
-        )
+    if _get_provider() == "gemini":
+        try:
+            model_instance = _gemini_model()
+            response = _gemini_generate_with_retry(model_instance, prompt)
+            return response.text.strip()
+        except Exception as e:
+            return f"Gemini Error: {str(e)}"
+    else:
+        client = _openai_client()
+        model_name = model or os.getenv("OPENAI_ANSWER_MODEL", "gpt-4.1-mini")
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=512,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"OpenAI Error: {str(e)}"
 
-    context_text = "\n\n".join(context_blocks)
-
-    system = (
-        "You are a legal RAG assistant. Answer strictly from the provided "
-        "context chunks. If the answer is not supported, say you do not know.\n"
-        "When you cite a chunk, use the format "
-        "\"According to <section> (Page N)...\" and make sure the citation "
-        "actually matches the supporting text."
-    )
-
-    user = (
-        f"Question:\n{question}\n\n"
-        "Context chunks:\n"
-        f"{context_text}\n\n"
-        "Answer the question using the most relevant chunks. If multiple "
-        "chunks are relevant, synthesize them, and include citations."
-    )
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0,
-        max_tokens=512,
-    )
-
-    text = response.choices[0].message.content or ""
-    return text.strip()
-
-
-def chunk_ids_for_logging(chunks: Iterable[CitationChunk]) -> list[str]:
-    """Return chunk IDs for lightweight logging and debugging."""
+def chunk_ids_for_logging(chunks: Iterable[Any]) -> list[str]:
     return [c.chunk_id for c in chunks]
-
